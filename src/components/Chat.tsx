@@ -18,21 +18,26 @@ export interface PromptItem {
 export default function (props: {
   prompts: PromptItem[]
   env: {
-    defaultSetting: Setting
-    defaultMessage: string
+    setting: Setting
+    message: string
     resetContinuousDialogue: boolean
   }
+  question?: string
 }) {
   let inputRef: HTMLTextAreaElement
   let containerRef: HTMLDivElement
 
-  const { defaultMessage, defaultSetting, resetContinuousDialogue } = props.env
+  const {
+    message: _message,
+    setting: _setting,
+    resetContinuousDialogue: _resetContinuousDialogue
+  } = props.env
   const [messageList, setMessageList] = createSignal<ChatMessage[]>([])
   const [inputContent, setInputContent] = createSignal("")
   const [currentAssistantMessage, setCurrentAssistantMessage] = createSignal("")
   const [loading, setLoading] = createSignal(false)
   const [controller, setController] = createSignal<AbortController>()
-  const [setting, setSetting] = createSignal(defaultSetting)
+  const [setting, setSetting] = createSignal(_setting)
   const [compatiblePrompt, setCompatiblePrompt] = createSignal<PromptItem[]>([])
   const [containerWidth, setContainerWidth] = createSignal("init")
   const fzf = new Fzf(props.prompts, {
@@ -83,29 +88,34 @@ export default function (props: {
         const parsed = JSON.parse(setting)
         archiveSession = parsed.archiveSession
         setSetting({
-          ...defaultSetting,
+          ..._setting,
           ...parsed,
-          ...(resetContinuousDialogue ? { continuousDialogue: false } : {})
+          ...(_resetContinuousDialogue ? { continuousDialogue: false } : {})
         })
       }
-      if (session && archiveSession) {
-        const parsed = JSON.parse(session)
-        if (parsed.length > 1) {
-          setMessageList(parsed)
+      if (props.question) {
+        window.history.replaceState(undefined, "ChatGPT", "/")
+        handleButtonClick(props.question)
+      } else {
+        if (session && archiveSession) {
+          const parsed = JSON.parse(session)
+          if (parsed.length > 1) {
+            setMessageList(parsed)
+          } else
+            setMessageList([
+              {
+                role: "assistant",
+                content: _message
+              }
+            ])
         } else
           setMessageList([
             {
               role: "assistant",
-              content: defaultMessage
+              content: _message
             }
           ])
-      } else
-        setMessageList([
-          {
-            role: "assistant",
-            content: defaultMessage
-          }
-        ])
+      }
     } catch {
       console.log("Setting parse error")
     }
@@ -129,12 +139,12 @@ export default function (props: {
         setMessageList([
           {
             role: "assistant",
-            content: defaultMessage
+            content: _message
           }
         ])
       } else if (
         messageList().length > 1 &&
-        messageList()[0].content === defaultMessage
+        messageList()[0].content === _message
       ) {
         setMessageList(messageList().slice(1))
       }
@@ -156,14 +166,15 @@ export default function (props: {
       if (inputContent() === "") {
         setCompatiblePrompt([])
       } else {
-        const { scrollHeight } = inputRef
-        setHeight(
-          `${
-            scrollHeight > window.innerHeight - 64
-              ? window.innerHeight - 64
-              : scrollHeight
-          }px`
-        )
+        const scrollHeight = inputRef?.scrollHeight
+        if (scrollHeight)
+          setHeight(
+            `${
+              scrollHeight > window.innerHeight - 64
+                ? window.innerHeight - 64
+                : scrollHeight
+            }px`
+          )
       }
       inputRef.focus()
     }
@@ -214,15 +225,14 @@ export default function (props: {
     } catch (error: any) {
       setLoading(false)
       setController()
-      setMessageList([
-        ...messageList(),
-        {
-          role: "error",
-          content: error.message.includes("aborted a request")
-            ? ""
-            : error.message.replace(/(sk-\w{5})\w+/g, "$1")
-        }
-      ])
+      if (!error.message.includes("aborted a request"))
+        setMessageList([
+          ...messageList(),
+          {
+            role: "error",
+            content: error.message.replace(/(sk-\w{5})\w+/g, "$1")
+          }
+        ])
     }
     archiveCurrentMessage()
   }
@@ -253,7 +263,8 @@ export default function (props: {
           : message,
         key: setting().openaiAPIKey || undefined,
         temperature: setting().openaiAPITemperature / 100,
-        password: setting().password
+        password: setting().password,
+        model: setting().model
       }),
       signal: controller.signal
     })
@@ -307,14 +318,16 @@ export default function (props: {
   function selectPrompt(prompt: string) {
     setInputContent(prompt)
     setCompatiblePrompt([])
-    const { scrollHeight } = inputRef
-    setHeight(
-      `${
-        scrollHeight > window.innerHeight - 64
-          ? window.innerHeight - 64
-          : scrollHeight
-      }px`
-    )
+
+    const scrollHeight = inputRef?.scrollHeight
+    if (scrollHeight)
+      setHeight(
+        `${
+          scrollHeight > window.innerHeight - 64
+            ? window.innerHeight - 64
+            : scrollHeight
+        }px`
+      )
     inputRef.focus()
   }
 
@@ -340,14 +353,15 @@ export default function (props: {
 
   async function handleInput() {
     setHeight("48px")
-    const { scrollHeight } = inputRef
-    setHeight(
-      `${
-        scrollHeight > window.innerHeight - 64
-          ? window.innerHeight - 64
-          : scrollHeight
-      }px`
-    )
+    const scrollHeight = inputRef?.scrollHeight
+    if (scrollHeight)
+      setHeight(
+        `${
+          scrollHeight > window.innerHeight - 64
+            ? window.innerHeight - 64
+            : scrollHeight
+        }px`
+      )
     if (!compositionend()) return
     const { value } = inputRef
     setInputContent(value)
