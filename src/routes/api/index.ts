@@ -1,10 +1,9 @@
-import type { APIRoute } from "astro"
 import type { ParsedEvent, ReconnectInterval } from "eventsource-parser"
 import { createParser } from "eventsource-parser"
 import type { ChatMessage, Model } from "~/types"
-import { countTokens } from "~/utils/tokens"
 import { splitKeys, randomKey, fetchWithTimeout } from "~/utils"
-import { defaultMaxInputTokens, defaultModel } from "~/system"
+import { defaultEnv } from "~/env"
+import type { APIEvent } from "solid-start/api"
 
 export const config = {
   runtime: "edge",
@@ -35,38 +34,23 @@ export const config = {
   ]
 }
 
-export const localKey = import.meta.env.OPENAI_API_KEY || ""
+export const localKey = process.env.OPENAI_API_KEY || ""
 
-export const baseURL = import.meta.env.NOGFW
-  ? "api.openai.com"
-  : (import.meta.env.OPENAI_API_BASE_URL || "api.openai.com").replace(
-      /^https?:\/\//,
-      ""
-    )
+export const baseURL =
+  process.env.NO_GFW !== "false"
+    ? defaultEnv.OPENAI_API_BASE_URL
+    : (
+        process.env.OPENAI_API_BASE_URL || defaultEnv.OPENAI_API_BASE_URL
+      ).replace(/^https?:\/\//, "")
 
-let maxInputTokens = defaultMaxInputTokens
-const _ = import.meta.env.MAX_INPUT_TOKENS
-if (_) {
-  try {
-    if (Number.isInteger(Number(_))) {
-      maxInputTokens = Object.entries(maxInputTokens).reduce((acc, [k]) => {
-        acc[k as Model] = Number(_)
-        return acc
-      }, {} as typeof maxInputTokens)
-    } else {
-      maxInputTokens = {
-        ...maxInputTokens,
-        ...JSON.parse(_)
-      }
-    }
-  } catch (e) {
-    console.error("Error parsing MAX_INPUT_TOKEN:", e)
-  }
-}
+// + 作用是将字符串转换为数字
+const timeout = isNaN(+process.env.TIMEOUT!)
+  ? defaultEnv.TIMEOUT
+  : +process.env.TIMEOUT!
 
-const pwd = import.meta.env.PASSWORD
+const passwordSet = process.env.PASSWORD || defaultEnv.PASSWORD
 
-export const post: APIRoute = async context => {
+export async function POST({ request }: APIEvent) {
   try {
     const body: {
       messages?: ChatMessage[]
@@ -74,16 +58,10 @@ export const post: APIRoute = async context => {
       temperature: number
       password?: string
       model: Model
-    } = await context.request.json()
-    const {
-      messages,
-      key = localKey,
-      temperature = 0.6,
-      password,
-      model = defaultModel
-    } = body
+    } = await request.json()
+    const { messages, key = localKey, temperature, password, model } = body
 
-    if (pwd && pwd !== password) {
+    if (passwordSet && password !== passwordSet) {
       throw new Error("密码错误，请联系网站管理员。")
     }
 
@@ -112,21 +90,6 @@ export const post: APIRoute = async context => {
 
     if (!apiKey) throw new Error("没有填写 OpenAI API key，或者 key 填写错误。")
 
-    const tokens = messages.reduce((acc, cur) => {
-      const tokens = countTokens(cur.content)
-      return acc + tokens
-    }, 0)
-
-    if (
-      tokens > (body.key ? defaultMaxInputTokens[model] : maxInputTokens[model])
-    ) {
-      if (messages.length > 1)
-        throw new Error(
-          `由于开启了连续对话选项，导致本次对话过长，请清除部分内容后重试，或者关闭连续对话选项。`
-        )
-      else throw new Error("太长了，缩短一点吧。")
-    }
-
     const encoder = new TextEncoder()
     const decoder = new TextDecoder()
 
@@ -137,17 +100,16 @@ export const post: APIRoute = async context => {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiKey}`
         },
-        timeout: 10000,
+        timeout,
         method: "POST",
         body: JSON.stringify({
-          model: model || "gpt-3.5-turbo",
+          model: model,
           messages: messages.map(k => ({ role: k.role, content: k.content })),
           temperature,
-          // max_tokens: 4096 - tokens,
           stream: true
         })
       }
-    ).catch(err => {
+    ).catch((err: { message: any }) => {
       return new Response(
         JSON.stringify({
           error: {
@@ -207,46 +169,75 @@ export const post: APIRoute = async context => {
 type Billing = {
   key: string
   rate: number
-  total_granted: number
-  total_used: number
-  total_available: number
+  totalGranted: number
+  totalUsed: number
+  totalAvailable: number
 }
 
 export async function fetchBilling(key: string): Promise<Billing> {
+  function formatDate(date: any) {
+    const year = date.getFullYear()
+    const month = (date.getMonth() + 1).toString().padStart(2, "0")
+    const day = date.getDate().toString().padStart(2, "0")
+    return `${year}-${month}-${day}`
+  }
   try {
-    const res = await fetch(
-      `https://${baseURL}/dashboard/billing/credit_grants`,
-      {
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${key}`
-        }
-      }
-    ).then(res => res.json())
-    return {
-      ...res,
-      key,
-      rate: res.total_available / res.total_granted
+    const now = new Date()
+    const startDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000)
+    const endDate = new Date(now.getTime() + 24 * 60 * 60 * 1000)
+
+    // 设置API请求URL和请求头
+    const urlSubscription =
+      "https://api.openai.com/v1/dashboard/billing/subscription" // 查是否订阅
+    const urlUsage = `https://api.openai.com/v1/dashboard/billing/usage?start_date=${formatDate(
+      startDate
+    )}&end_date=${formatDate(endDate)}` // 查使用量
+    const headers = {
+      Authorization: "Bearer " + key,
+      "Content-Type": "application/json"
     }
-  } catch {
+
+    // 获取API限额
+    const subscriptionData = await fetch(urlSubscription, { headers }).then(r =>
+      r.json()
+    )
+    if (subscriptionData.error?.message)
+      throw new Error(subscriptionData.error.message)
+    const totalGranted = subscriptionData.hard_limit_usd
+    // 获取已使用量
+    const usageData = await fetch(urlUsage, { headers }).then(r => r.json())
+    const totalUsed = usageData.total_usage / 100
+    // 计算剩余额度
+    const totalAvailable = totalGranted - totalUsed
+    return {
+      totalGranted,
+      totalUsed,
+      totalAvailable,
+      key,
+      rate: totalAvailable / totalGranted
+    }
+  } catch (e) {
+    console.error(e)
     return {
       key,
       rate: 0,
-      total_granted: 0,
-      total_used: 0,
-      total_available: 0
+      totalGranted: 0,
+      totalUsed: 0,
+      totalAvailable: 0
     }
   }
 }
 
 export async function genBillingsTable(billings: Billing[]) {
   const table = billings
-    .map(
-      (k, i) =>
-        `| ${k.key.slice(0, 8)} | ${k.total_available.toFixed(4)}(${(
-          k.rate * 100
-        ).toFixed(1)}%) | ${k.total_used.toFixed(4)} | ${k.total_granted} |`
-    )
+    .sort((m, n) => (m.totalGranted === 0 ? -1 : n.rate - m.rate))
+    .map((k, i) => {
+      if (k.totalGranted === 0)
+        return `| ${k.key.slice(0, 8)} | 不可用 | —— | —— |`
+      return `| ${k.key.slice(0, 8)} | ${k.totalAvailable.toFixed(4)}(${(
+        k.rate * 100
+      ).toFixed(1)}%) | ${k.totalUsed.toFixed(4)} | ${k.totalGranted} |`
+    })
     .join("\n")
 
   return `| Key  | 剩余 | 已用 | 总额度 |
